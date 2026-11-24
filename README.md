@@ -154,8 +154,8 @@ sprout32/
 
 ## Licence
 
-À définir par l'auteur. Suggestion : matériel sous **CC BY-SA 4.0** (ou CERN-OHL), firmware sous **licence MIT**.
+matériel sous **CC BY-SA 4.0** (ou CERN-OHL), firmware sous **licence MIT**.
 
 ## Auteur
 
-*À compléter.*
+Thomas G
