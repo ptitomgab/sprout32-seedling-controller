@@ -77,7 +77,7 @@ Les sondes DS18B20 (rouge / noir / jaune) se raccordent dans l'ordre 3V3 / GND /
 
 ## Câblage du module relais
 
-Le module relais utilisé est un modèle **6 canaux 5 V, optocouplé, à déclenchement niveau bas**, avec cavalier VCC / JD-VCC. **Prends la version 5 V** (les versions 12 V et 24 V existent).
+Le module relais utilisé est un modèle **6 canaux 5 V, optocouplé, à déclenchement niveau bas**, avec cavalier VCC / JD-VCC.
 
 1. **Retire le cavalier** entre VCC et JD-VCC.
 2. Depuis ALIM-RELAIS : **3V3 → VCC**, **GND → GND**, **5V → JD-VCC** (vérifie l'ordre sur la sérigraphie de ton module).
