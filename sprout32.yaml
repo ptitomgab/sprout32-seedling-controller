@@ -1,0 +1,522 @@
+# ============================================================================
+#  Sprout32 - contrôleur de semis ESP32-C3 (ESPHome)
+#  Matériel : https://github.com/ptitomgab/sprout32-seedling-controller
+#
+#  Fonctions :
+#    - 3 thermostats (un par niveau) pilotant les tapis chauffants
+#    - 4 sondes DS18B20 (1-Wire) + 1 sonde SHT20/30/40 (I2C)
+#    - ventilateur : cycles périodiques + déclenchement sur humidité
+#    - lampe : photopériode réglable (optionnelle, relais IN5)
+#    - sécurité : coupure du chauffage si sonde HS ou température trop haute
+#    - LED RGB embarquée (GPIO10) comme voyant d'état
+#
+#  Relais (module 6 canaux, niveau bas) :
+#    IN1 GPIO3 = tapis niveau 1     IN4 GPIO6 = ventilateur
+#    IN2 GPIO4 = tapis niveau 2     IN5 GPIO7 = lampe (optionnel)
+#    IN3 GPIO5 = tapis niveau 3     IN6 GPIO8 = libre (non utilisé ici)
+# ============================================================================
+
+substitutions:
+  name: sprout32
+  friendly_name: Sprout32
+  timezone: Europe/Paris
+
+  # --- Consignes par défaut (ensuite modifiables depuis Home Assistant) ---
+  consigne_n1: "22 °C"   # niveau 1 : germination
+  consigne_n2: "20 °C"
+  consigne_n3: "20 °C"
+
+  # --- Sécurité : coupure du chauffage au-delà de cette température (°C) ---
+  temp_max_securite: "30.0"
+
+  # --- Ventilateur (valeurs par défaut, modifiables ensuite) ---
+  vent_periode_defaut: "30"    # un cycle toutes les 30 min
+  vent_marche_defaut: "5"      # 5 min de marche par cycle
+  vent_humidite_defaut: "75"   # marche forcée au-dessus de 75 % d'humidité
+
+  # --- Lampe (valeurs par défaut) ---
+  lampe_debut_defaut: "7"      # allumage à 7 h
+  lampe_duree_defaut: "16"     # 16 h de lumière
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Les logs passent par l'USB natif de l'ESP32-C3 : GPIO20/21 restent libres.
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret sprout32__api_key
+  reboot_timeout: 0s   # pas de redémarrage si Home Assistant est absent : la régulation reste locale
+
+# Les mises à jour se font en Wi-Fi (USB inaccessible une fois en boîtier).
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "Sprout32 Fallback"
+    password: !secret sprout32__ap_password
+
+  use_address: 192.168.20.73
+captive_portal:
+
+# Interface web locale : http://sprout32.local (ou l'adresse IP de l'ESP32).
+# Protégée par mot de passe ; les relais restent masqués (ils sont "internal").
+web_server:
+  port: 80
+  version: 3
+  auth:
+    username: admin
+    password: !secret sprout32__web_password
+
+time:
+  - platform: sntp
+    id: heure
+    timezone: ${timezone}
+
+# ----------------------------------------------------------------------------
+#  Bus
+# ----------------------------------------------------------------------------
+one_wire:
+  - platform: gpio
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true   # GPIO2 : pull-up 4,7 kOhm sur le PCB
+
+i2c:
+  sda: GPIO1
+  scl: GPIO0
+  frequency: 50kHz
+  scan: true
+
+# ----------------------------------------------------------------------------
+#  Variables internes
+# ----------------------------------------------------------------------------
+globals:
+  - id: vent_hum_actif
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: defaut_capteurs
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+# ----------------------------------------------------------------------------
+#  Capteurs
+# ----------------------------------------------------------------------------
+sensor:
+  # Sondes DS18B20 : REMPLACE les adresses par les tiennes
+  # (voir sprout32-test.yaml : on les lit une par une dans les logs).
+  - platform: dallas_temp
+    id: temp_n1
+    name: "Température niveau 1"
+    address: 0x1111111111111111   # À REMPLACER
+    update_interval: 15s
+
+  - platform: dallas_temp
+    id: temp_n2
+    name: "Température niveau 2"
+    address: 0x2222222222222222   # À REMPLACER
+    update_interval: 15s
+
+  - platform: dallas_temp
+    id: temp_n3
+    name: "Température niveau 3"
+    address: 0x3333333333333333   # À REMPLACER
+    update_interval: 15s
+
+  - platform: dallas_temp
+    id: temp_ambiante
+    name: "Température ambiante"
+    address: 0x4444444444444444   # À REMPLACER (sonde hors tente, informative)
+    update_interval: 30s
+
+  # Sonde d'humidité : SHT40 par défaut.
+  #   SHT30 / SHT31 : platform: sht3xd (address: 0x44)
+  #   SHT20         : platform: htu21d avec model: SHT21
+  - platform: sht4x
+    address: 0x44
+    temperature:
+      name: "Température air tente"
+      id: temp_tente
+    humidity:
+      name: "Humidité tente"
+      id: hum_tente
+    update_interval: 30s
+
+  # Diagnostic : utile pour juger la couverture Wi-Fi du sous-sol.
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "Adresse IP"
+      entity_category: diagnostic
+
+# ----------------------------------------------------------------------------
+#  Relais (niveau bas, éteints au démarrage)
+# ----------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: relais_chauffage_n1
+    pin:
+      number: GPIO3
+      inverted: true
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  - platform: gpio
+    id: relais_chauffage_n2
+    pin:
+      number: GPIO4
+      inverted: true
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  - platform: gpio
+    id: relais_chauffage_n3
+    pin:
+      number: GPIO5
+      inverted: true
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  - platform: gpio
+    id: relais_ventilo
+    pin:
+      number: GPIO6
+      inverted: true
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  - platform: gpio
+    id: relais_lampe
+    pin:
+      number: GPIO7
+      inverted: true
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+  # --- Commandes exposées dans Home Assistant ---
+  - platform: template
+    id: vent_auto
+    name: "Ventilateur auto"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    id: vent_force
+    name: "Ventilateur marche forcée"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    id: lampe_auto
+    name: "Lampe photopériode auto"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    id: lampe_manuel
+    name: "Lampe marche forcée"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    id: led_active
+    name: "LED d'état"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+# ----------------------------------------------------------------------------
+#  Réglages (entités numériques conservées après redémarrage)
+# ----------------------------------------------------------------------------
+number:
+  - platform: template
+    id: vent_periode_min
+    name: "Ventilateur période (min)"
+    optimistic: true
+    min_value: 5
+    max_value: 240
+    step: 5
+    initial_value: ${vent_periode_defaut}
+    restore_value: true
+    unit_of_measurement: "min"
+    mode: box
+
+  - platform: template
+    id: vent_marche_min
+    name: "Ventilateur marche par cycle (min)"
+    optimistic: true
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: ${vent_marche_defaut}
+    restore_value: true
+    unit_of_measurement: "min"
+    mode: box
+
+  - platform: template
+    id: vent_humidite_seuil
+    name: "Ventilateur seuil humidité"
+    optimistic: true
+    min_value: 40
+    max_value: 95
+    step: 1
+    initial_value: ${vent_humidite_defaut}
+    restore_value: true
+    unit_of_measurement: "%"
+    mode: box
+
+  - platform: template
+    id: lampe_debut
+    name: "Lampe heure d'allumage"
+    optimistic: true
+    min_value: 0
+    max_value: 23
+    step: 1
+    initial_value: ${lampe_debut_defaut}
+    restore_value: true
+    unit_of_measurement: "h"
+    mode: box
+
+  - platform: template
+    id: lampe_duree
+    name: "Lampe durée d'éclairage"
+    optimistic: true
+    min_value: 1
+    max_value: 24
+    step: 1
+    initial_value: ${lampe_duree_defaut}
+    restore_value: true
+    unit_of_measurement: "h"
+    mode: box
+
+# ----------------------------------------------------------------------------
+#  Thermostats : un par niveau (chauffage seul)
+# ----------------------------------------------------------------------------
+climate:
+  - platform: thermostat
+    name: "Chauffage niveau 1"
+    id: chauffage_n1
+    sensor: temp_n1
+    default_preset: Consigne
+    on_boot_restore_from: memory
+    preset:
+      - name: Consigne
+        default_target_temperature_low: ${consigne_n1}
+        mode: heat
+    min_heating_off_time: 120s
+    min_heating_run_time: 120s
+    min_idle_time: 30s
+    heat_deadband: 0.5 °C
+    heat_overrun: 0.5 °C
+    heat_action:
+      - switch.turn_on: relais_chauffage_n1
+    idle_action:
+      - switch.turn_off: relais_chauffage_n1
+    visual:
+      min_temperature: 10 °C
+      max_temperature: 30 °C
+      temperature_step: 0.5 °C
+
+  - platform: thermostat
+    name: "Chauffage niveau 2"
+    id: chauffage_n2
+    sensor: temp_n2
+    default_preset: Consigne
+    on_boot_restore_from: memory
+    preset:
+      - name: Consigne
+        default_target_temperature_low: ${consigne_n2}
+        mode: heat
+    min_heating_off_time: 120s
+    min_heating_run_time: 120s
+    min_idle_time: 30s
+    heat_deadband: 0.5 °C
+    heat_overrun: 0.5 °C
+    heat_action:
+      - switch.turn_on: relais_chauffage_n2
+    idle_action:
+      - switch.turn_off: relais_chauffage_n2
+    visual:
+      min_temperature: 10 °C
+      max_temperature: 30 °C
+      temperature_step: 0.5 °C
+
+  - platform: thermostat
+    name: "Chauffage niveau 3"
+    id: chauffage_n3
+    sensor: temp_n3
+    default_preset: Consigne
+    on_boot_restore_from: memory
+    preset:
+      - name: Consigne
+        default_target_temperature_low: ${consigne_n3}
+        mode: heat
+    min_heating_off_time: 120s
+    min_heating_run_time: 120s
+    min_idle_time: 30s
+    heat_deadband: 0.5 °C
+    heat_overrun: 0.5 °C
+    heat_action:
+      - switch.turn_on: relais_chauffage_n3
+    idle_action:
+      - switch.turn_off: relais_chauffage_n3
+    visual:
+      min_temperature: 10 °C
+      max_temperature: 30 °C
+      temperature_step: 0.5 °C
+
+# ----------------------------------------------------------------------------
+#  Voyants et alertes
+# ----------------------------------------------------------------------------
+binary_sensor:
+  - platform: template
+    name: "Défaut capteurs"
+    device_class: problem
+    lambda: "return id(defaut_capteurs);"
+
+  - platform: template
+    name: "Chauffage niveau 1 actif"
+    device_class: heat
+    lambda: "return id(relais_chauffage_n1).state;"
+
+  - platform: template
+    name: "Chauffage niveau 2 actif"
+    device_class: heat
+    lambda: "return id(relais_chauffage_n2).state;"
+
+  - platform: template
+    name: "Chauffage niveau 3 actif"
+    device_class: heat
+    lambda: "return id(relais_chauffage_n3).state;"
+
+  - platform: template
+    name: "Ventilateur actif"
+    lambda: "return id(relais_ventilo).state;"
+
+  - platform: template
+    name: "Lampe allumée"
+    device_class: light
+    lambda: "return id(relais_lampe).state;"
+
+# LED RGB embarquée (WS2812 sur GPIO10)
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO10
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: GRB
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+# ----------------------------------------------------------------------------
+#  Logique : sécurité, ventilateur, lampe, voyant
+# ----------------------------------------------------------------------------
+interval:
+  # --- SÉCURITÉ : coupe un chauffage si sa sonde est HS ou trop chaude ---
+  - interval: 5s
+    then:
+      - lambda: |-
+          auto garde = [](sensor::Sensor *s, switch_::Switch *relais) -> bool {
+            bool invalide = !s->has_state() || std::isnan(s->state);
+            bool trop_chaud = !invalide && s->state > ${temp_max_securite};
+            if (invalide || trop_chaud) {
+              if (relais->state) relais->turn_off();
+            }
+            return invalide || trop_chaud;
+          };
+          bool d1 = garde(id(temp_n1), id(relais_chauffage_n1));
+          bool d2 = garde(id(temp_n2), id(relais_chauffage_n2));
+          bool d3 = garde(id(temp_n3), id(relais_chauffage_n3));
+          bool dh = !id(hum_tente).has_state() || std::isnan(id(hum_tente).state);
+          id(defaut_capteurs) = d1 || d2 || d3 || dh;
+
+  # --- VENTILATEUR et LAMPE ---
+  - interval: 10s
+    then:
+      - lambda: |-
+          // Ventilateur : marche forcée, ou cycles + humidité
+          bool vent = false;
+          if (id(vent_force).state) {
+            vent = true;
+          } else if (id(vent_auto).state) {
+            uint32_t periode = (uint32_t) (id(vent_periode_min).state * 60000.0f);
+            uint32_t marche = (uint32_t) (id(vent_marche_min).state * 60000.0f);
+            if (periode > 0 && (millis() % periode) < marche) vent = true;
+            if (id(hum_tente).has_state() && !std::isnan(id(hum_tente).state)) {
+              float h = id(hum_tente).state;
+              float seuil = id(vent_humidite_seuil).state;
+              if (h > seuil) id(vent_hum_actif) = true;
+              else if (h < seuil - 5.0f) id(vent_hum_actif) = false;
+              if (id(vent_hum_actif)) vent = true;
+            }
+          }
+          if (vent) id(relais_ventilo).turn_on();
+          else id(relais_ventilo).turn_off();
+
+          // Lampe : marche forcée, ou photopériode (nécessite l'heure NTP)
+          bool lampe = false;
+          if (id(lampe_manuel).state) {
+            lampe = true;
+          } else if (id(lampe_auto).state) {
+            auto t = id(heure).now();
+            if (t.is_valid()) {
+              int h = t.hour;
+              int debut = (int) id(lampe_debut).state;
+              int duree = (int) id(lampe_duree).state;
+              if (duree >= 24) {
+                lampe = true;
+              } else {
+                int fin = (debut + duree) % 24;
+                lampe = (debut < fin) ? (h >= debut && h < fin) : (h >= debut || h < fin);
+              }
+            }
+          }
+          if (lampe) id(relais_lampe).turn_on();
+          else id(relais_lampe).turn_off();
+
+  # --- VOYANT D'ÉTAT : rouge = défaut, orange = pas de Wi-Fi,
+  #     bleu = Wi-Fi sans Home Assistant, vert = tout va bien ---
+  - interval: 2s
+    then:
+      - lambda: |-
+          bool wifi_ok = wifi::global_wifi_component->is_connected();
+          bool api_ok = api::global_api_server->is_connected();
+          float r = 0.0f, g = 1.0f, b = 0.0f;
+          if (id(defaut_capteurs)) { r = 1.0f; g = 0.0f; b = 0.0f; }
+          else if (!wifi_ok) { r = 1.0f; g = 0.35f; b = 0.0f; }
+          else if (!api_ok) { r = 0.0f; g = 0.4f; b = 1.0f; }
+          auto call = id(status_led).make_call();
+          if (!id(led_active).state) {
+            call.set_state(false);
+          } else {
+            call.set_state(true);
+            call.set_rgb(r, g, b);
+            call.set_brightness(0.15f);
+          }
+          call.perform();

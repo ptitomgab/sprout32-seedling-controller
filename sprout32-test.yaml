@@ -1,0 +1,145 @@
+# ============================================================================
+#  Sprout32 - configuration de TEST pour la mise en service du PCB
+#
+#  À flasher en premier (ESP32 hors du PCB, par USB), puis à mettre à jour en
+#  Wi-Fi une fois installé. Aucun thermostat ici : tu commandes chaque relais
+#  à la main depuis une page web locale, sans charge 230 V branchée.
+#
+#  Page web de test : http://sprout32-test.local  (ou l'adresse IP affichée dans les logs)
+#
+#  À vérifier avec ce fichier :
+#    1. chaque relais clique et sa LED s'allume / s'éteint franchement ;
+#    2. au repos, aucun relais ne claque ni ne reste à moitié collé ;
+#    3. la LED RGB (GPIO10) s'allume ;
+#    4. la sonde SHT est détectée (logs : "Found i2c device at address 0x44") ;
+#    5. les adresses de tes sondes DS18B20 (voir la procédure plus bas).
+# ============================================================================
+
+esphome:
+  name: sprout32-test
+  friendly_name: Sprout32 Test
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "Sprout32 Test Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# ----------------------------------------------------------------------------
+#  Bus
+# ----------------------------------------------------------------------------
+one_wire:
+  - platform: gpio
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+
+i2c:
+  sda: GPIO1
+  scl: GPIO0
+  frequency: 50kHz
+  scan: true
+
+# ----------------------------------------------------------------------------
+#  Capteurs
+#
+#  Identifier les sondes DS18B20 : branche UNE SEULE sonde à la fois sur un
+#  connecteur S1 à S4. Sans adresse déclarée, ESPHome utilise la sonde trouvée
+#  et affiche son adresse (0x...) dans les logs. Note-la et marque la sonde
+#  (ruban, étiquette) : "niveau 1", "niveau 2", etc. Recommence pour chacune,
+#  puis recopie les adresses dans sprout32.yaml.
+# ----------------------------------------------------------------------------
+sensor:
+  - platform: dallas_temp
+    name: "Sonde DS18B20 (test)"
+    update_interval: 5s
+
+  - platform: sht4x
+    address: 0x44
+    temperature:
+      name: "SHT température"
+    humidity:
+      name: "SHT humidité"
+    update_interval: 10s
+
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    update_interval: 30s
+
+# ----------------------------------------------------------------------------
+#  Relais : commande manuelle, éteints au démarrage (module niveau bas)
+# ----------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    name: "Relais IN1 (GPIO3)"
+    pin:
+      number: GPIO3
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Relais IN2 (GPIO4)"
+    pin:
+      number: GPIO4
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Relais IN3 (GPIO5)"
+    pin:
+      number: GPIO5
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Relais IN4 (GPIO6)"
+    pin:
+      number: GPIO6
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Relais IN5 (GPIO7)"
+    pin:
+      number: GPIO7
+      inverted: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: gpio
+    name: "Relais IN6 (GPIO8)"
+    pin:
+      number: GPIO8
+      inverted: true
+      ignore_strapping_warning: true
+    restore_mode: ALWAYS_OFF
+
+# ----------------------------------------------------------------------------
+#  LED RGB embarquée (WS2812 sur GPIO10) : test d'allumage
+# ----------------------------------------------------------------------------
+light:
+  - platform: esp32_rmt_led_strip
+    name: "LED RGB"
+    pin: GPIO10
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
